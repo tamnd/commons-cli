@@ -1,60 +1,79 @@
 // Package commons is the library behind the commons command line:
-// the HTTP client, request shaping, and the typed data models for commons.
+// the HTTP client, request shaping, wire types, and the typed data models
+// for Wikimedia Commons.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The Client is the spine every command shares. It sets a real User-Agent
+// (required by Wikimedia policy), paces requests so a busy session stays
+// polite, and retries the transient failures (429 and 5xx) that any public
+// API throws under load. Build your endpoint calls and JSON decoding on top
+// of it.
 package commons
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to commons. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "commons/dev (+https://github.com/tamnd/commons-cli)"
+// APIBase is the Wikimedia Commons MediaWiki API endpoint.
+const APIBase = "https://commons.wikimedia.org/w/api.php"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at commons.com; change it once you
-// know the real endpoints you want to read.
-const Host = "commons.com"
+// Host is the commons hostname used for URI matching in domain.go.
+const Host = "commons.wikimedia.org"
 
-// BaseURL is the root every request is built from.
+// BaseURL is the root of the wiki, used to build human-readable page URLs.
 const BaseURL = "https://" + Host
 
-// Client talks to commons over HTTP.
+// Config holds tunable parameters for the Client.
+type Config struct {
+	BaseURL   string
+	UserAgent string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
+}
+
+// DefaultConfig returns the recommended Config for production use.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   APIBase,
+		UserAgent: "commons-cli/0.1.0 (github.com/tamnd/commons-cli)",
+		Rate:      500 * time.Millisecond,
+		Timeout:   15 * time.Second,
+		Retries:   3,
+	}
+}
+
+// Client talks to the Wikimedia Commons API over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+	BaseURL   string
+	Rate      time.Duration
+	Retries   int
 
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
+// NewClient returns a Client from cfg.
+func NewClient(cfg Config) *Client {
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
+		UserAgent: cfg.UserAgent,
+		BaseURL:   cfg.BaseURL,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// get fetches url and returns the response body. It paces and retries
+// according to the client's settings.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,7 +83,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,12 +92,12 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -123,78 +142,267 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on commons.com. It is a stand-in for the typed records you
-// will model from the real commons endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `commons cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// ---------- public output types ----------
+
+// File is a Wikimedia Commons media file.
+// FileName is the bare name without "File:" prefix; it doubles as the kit id.
+type File struct {
+	FileName    string `json:"file_name" kit:"id"`
+	Title       string `json:"title"`
+	PageID      int    `json:"page_id"`
+	URL         string `json:"url,omitempty"`
+	Size        int    `json:"size,omitempty"`
+	MediaType   string `json:"media_type,omitempty"`
+	Description string `json:"description,omitempty"`
+	Author      string `json:"author,omitempty"`
+	License     string `json:"license,omitempty"`
+	Date        string `json:"date,omitempty"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+// Category is an entry returned by the category-members list.
+type Category struct {
+	Title  string `json:"title"`
+	PageID int    `json:"page_id"`
+	NS     int    `json:"ns"`
+}
+
+// ---------- wire types ----------
+
+type wireSearchResponse struct {
+	Query struct {
+		SearchInfo struct {
+			TotalHits int `json:"totalhits"`
+		} `json:"searchinfo"`
+		Search []struct {
+			Title  string `json:"title"`
+			PageID int    `json:"pageid"`
+		} `json:"search"`
+	} `json:"query"`
+}
+
+type wireFileResponse struct {
+	Query struct {
+		Pages map[string]struct {
+			Title     string `json:"title"`
+			PageID    int    `json:"pageid"`
+			ImageInfo []struct {
+				URL       string `json:"url"`
+				Size      int    `json:"size"`
+				MediaType string `json:"mediatype"`
+				ExtMeta   map[string]struct {
+					Value string `json:"value"`
+				} `json:"extmetadata"`
+			} `json:"imageinfo"`
+		} `json:"pages"`
+	} `json:"query"`
+}
+
+type wireCategoryResponse struct {
+	Query struct {
+		CategoryMembers []struct {
+			Title  string `json:"title"`
+			PageID int    `json:"pageid"`
+			NS     int    `json:"ns"`
+		} `json:"categorymembers"`
+	} `json:"query"`
+}
+
+type wireRecentResponse struct {
+	Query struct {
+		RecentChanges []struct {
+			Title     string `json:"title"`
+			PageID    int    `json:"pageid"`
+			Timestamp string `json:"timestamp"`
+		} `json:"recentchanges"`
+	} `json:"query"`
+}
+
+// ---------- API methods ----------
+
+// SearchFiles searches Wikimedia Commons files by keyword.
+// limit controls how many results to return; offset enables pagination.
+func (c *Client) SearchFiles(ctx context.Context, query string, limit, offset int) ([]*File, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	params := url.Values{
+		"action":      {"query"},
+		"list":        {"search"},
+		"srsearch":    {query},
+		"srnamespace": {"6"},
+		"srlimit":     {fmt.Sprintf("%d", limit)},
+		"sroffset":    {fmt.Sprintf("%d", offset)},
+		"format":      {"json"},
+	}
+	rawURL := c.BaseURL + "?" + params.Encode()
+	body, err := c.get(ctx, rawURL)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+	var wire wireSearchResponse
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("search decode: %w", err)
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	out := make([]*File, 0, len(wire.Query.Search))
+	for _, s := range wire.Query.Search {
+		out = append(out, &File{
+			FileName: fileBaseName(s.Title),
+			Title:    s.Title,
+			PageID:   s.PageID,
+		})
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+// GetFile fetches file info and metadata for a single file.
+// title should be the bare filename without "File:" prefix; the prefix is
+// added automatically.
+func (c *Client) GetFile(ctx context.Context, title string) (*File, error) {
+	if !strings.HasPrefix(title, "File:") {
+		title = "File:" + title
 	}
-	return out
+	params := url.Values{
+		"action":  {"query"},
+		"titles":  {title},
+		"prop":    {"imageinfo"},
+		"iiprop":  {"url|size|mediatype|extmetadata"},
+		"format":  {"json"},
+	}
+	rawURL := c.BaseURL + "?" + params.Encode()
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var wire wireFileResponse
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("file decode: %w", err)
+	}
+	for _, page := range wire.Query.Pages {
+		f := &File{
+			FileName: fileBaseName(page.Title),
+			Title:    page.Title,
+			PageID:   page.PageID,
+		}
+		if len(page.ImageInfo) > 0 {
+			ii := page.ImageInfo[0]
+			f.URL = ii.URL
+			f.Size = ii.Size
+			f.MediaType = ii.MediaType
+			if v, ok := ii.ExtMeta["ImageDescription"]; ok {
+				f.Description = stripHTML(v.Value)
+			}
+			if v, ok := ii.ExtMeta["Artist"]; ok {
+				f.Author = stripHTML(v.Value)
+			}
+			if v, ok := ii.ExtMeta["LicenseShortName"]; ok {
+				f.License = v.Value
+			}
+			if v, ok := ii.ExtMeta["DateTime"]; ok {
+				f.Date = v.Value
+			}
+		}
+		return f, nil
+	}
+	return nil, fmt.Errorf("file not found: %s", title)
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// ListCategory lists files that belong to a Wikimedia Commons category.
+// name should be the bare category name without "Category:" prefix.
+func (c *Client) ListCategory(ctx context.Context, name string, limit int) ([]*Category, error) {
+	if limit <= 0 {
+		limit = 20
 	}
-	return s
+	if !strings.HasPrefix(name, "Category:") {
+		name = "Category:" + name
+	}
+	params := url.Values{
+		"action":      {"query"},
+		"list":        {"categorymembers"},
+		"cmtitle":     {name},
+		"cmnamespace": {"6"},
+		"cmlimit":     {fmt.Sprintf("%d", limit)},
+		"format":      {"json"},
+	}
+	rawURL := c.BaseURL + "?" + params.Encode()
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var wire wireCategoryResponse
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("category decode: %w", err)
+	}
+	out := make([]*Category, 0, len(wire.Query.CategoryMembers))
+	for _, m := range wire.Query.CategoryMembers {
+		out = append(out, &Category{
+			Title:  m.Title,
+			PageID: m.PageID,
+			NS:     m.NS,
+		})
+	}
+	return out, nil
+}
+
+// RecentUploads returns recently uploaded files.
+func (c *Client) RecentUploads(ctx context.Context, limit int) ([]*File, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	params := url.Values{
+		"action":      {"query"},
+		"list":        {"recentchanges"},
+		"rcnamespace": {"6"},
+		"rclimit":     {fmt.Sprintf("%d", limit)},
+		"rctype":      {"new"},
+		"format":      {"json"},
+	}
+	rawURL := c.BaseURL + "?" + params.Encode()
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var wire wireRecentResponse
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("recent decode: %w", err)
+	}
+	out := make([]*File, 0, len(wire.Query.RecentChanges))
+	for _, rc := range wire.Query.RecentChanges {
+		out = append(out, &File{
+			FileName: fileBaseName(rc.Title),
+			Title:    rc.Title,
+			PageID:   rc.PageID,
+			Date:     rc.Timestamp,
+		})
+	}
+	return out, nil
+}
+
+// ---------- helpers ----------
+
+// fileBaseName strips the "File:" prefix from a wiki title, returning just the
+// bare filename used as the kit id and as input to GetFile.
+func fileBaseName(title string) string {
+	return strings.TrimPrefix(title, "File:")
+}
+
+// stripHTML removes simple HTML tags from a string (description/author fields
+// from extmetadata often contain markup).
+var htmlTagReplacer = strings.NewReplacer("<", " <", ">", "> ")
+
+func stripHTML(s string) string {
+	// Remove tags by iterating over < > pairs.
+	var b strings.Builder
+	inTag := false
+	for _, r := range s {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+		case !inTag:
+			b.WriteRune(r)
+		}
+	}
+	// Collapse whitespace.
+	return strings.Join(strings.Fields(b.String()), " ")
 }
